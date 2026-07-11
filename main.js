@@ -15,6 +15,7 @@ const LOG_PREFIX = "obsidian-tray",
   LOG_TRAY_ICON = "creating tray icon",
   LOG_REGISTER_HOTKEY = "registering hotkey",
   LOG_UNREGISTER_HOTKEY = "unregistering hotkey",
+  LOG_REGISTER_HANDLER = "registering URI handler",
   ACTION_QUICK_NOTE = "Quick Note",
   ACTION_SHOW = "Show Vault",
   ACTION_HIDE = "Hide Vault",
@@ -36,11 +37,30 @@ const LOG_PREFIX = "obsidian-tray",
   OBSIDIAN_BASE64_ICON = `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAHZSURBVDhPlZKxTxRBFMa/XZcF7nIG7mjxjoRCwomJxgsFdhaASqzQxFDzB1AQKgstLGxIiBQGJBpiCCGx8h+wgYaGgAWNd0dyHofeEYVwt/PmOTMZV9aDIL/s5pvZvPfN9yaL/+HR3eXcypta0m4juFbP5GHuXc9IbunDFc9db/G81/ZzhDMN7g8td47mll4R5BfHwZN4LOaA+fHa259PbUmIYzWkt3e2NZNo3/V9v1vvU6kkstk+tLW3ItUVr/m+c3N8MlkwxYqmBFcbwUQQCNOcyVzDwEAWjuPi5DhAMV/tKOYPX5hCyz8Gz1zX5SmWjBvZfmTSaRBJkGAIoxJHv+pVW2yIGNxOJ8bUVNcFEWLxuG1ia6JercTbttwQTeDwPS0kCMXiXtgk/jQrFUw7ptYSMWApF40yo/ytjHq98fdk3ayVE+cn2CxMb6ruz9qAJKFUKoWza1VJSi/n0+ffgYHdWW2gHuxXymg0gjCB0sjpmiaDnkL3RzDyzLqBUKns2ztQqUR0fk2TwSrGSf1eczqF5vsPZRCQSSAFLk6gqctgQRkc6TWRQLV2YMYQki9OoNkqzFQ9r+WOGuW5CrJbOzyAlPKr6MSGLbkcDwbf35oY/jRkt6cAfgNwowruAMz9AgAAAABJRU5ErkJggg==`,
   log = (message) => console.log(`${LOG_PREFIX}: ${message}`);
 
-let tray, plugin;
+let tray, plugin, isQuitting = false;
+// #35: globalThis key holds the live native Tray so a plugin reload
+// (which re-evaluates the module and resets `tray` to undefined) can
+// still destroy the previously-created icon instead of orphaning it.
+const TRAY_GLOBAL_KEY = "__obsidianTrayInstance";
 const obsidian = require("obsidian"),
   { app, Tray, Menu } = require("electron").remote,
   { nativeImage, BrowserWindow } = require("electron").remote,
   { getCurrentWindow, globalShortcut } = require("electron").remote;
+
+// PR #58: when obsidian is relaunched from taskbar/shortcut while already
+// running in the background, a second instance spawns the vault picker
+// instead of revealing the hidden window — intercept and focus the
+// existing window instead (fixes #14, #40, #48, #62)
+app.on("second-instance", () => {
+  const win2 = BrowserWindow.getAllWindows()[0];
+  // prevents "flashing" (quick open->close obsidian start window)
+  win2.setOpacity(0.0);
+  win2.once("ready-to-show", () => {
+    win2.close();
+  });
+  getCurrentWindow().show();
+  getCurrentWindow().focus();
+});
 
 const vaultWindows = new Set(),
   maximizedWindows = new Set(),
@@ -48,7 +68,7 @@ const vaultWindows = new Set(),
   observeWindows = () => {
     const onWindowCreation = (win) => {
       vaultWindows.add(win);
-      win.setSkipTaskbar(plugin.settings.hideTaskbarIcon);
+      updateTaskbarIcons();
       win.on("close", () => {
         if (win !== getCurrentWindow()) vaultWindows.delete(win);
       });
@@ -59,22 +79,13 @@ const vaultWindows = new Set(),
     };
     onWindowCreation(getCurrentWindow());
     getCurrentWindow().webContents.on("did-create-window", onWindowCreation);
-    if (process.platform === "darwin") {
-      // on macos, the "hide taskbar icon" option is implemented
-      // via app.dock.hide(): thus, the app as a whole will be
-      // hidden from the dock, including windows from other vaults.
-      // when a vault is closed via the "close vault" button,
-      // the cleanup process will call app.dock.show() to restore
-      // access to any other open vaults w/out the tray enabled
-      // => thus, this listener is required to re-hide the dock
-      // if switching to another vault with the option enabled
-      getCurrentWindow().on("focus", () => {
-        if (plugin.settings.hideTaskbarIcon) hideTaskbarIcons();
-      });
-    }
   },
   showWindows = () => {
     log(LOG_SHOWING_WINDOWS);
+    // restore the dock icon before showing windows so macos
+    // activates the app properly
+    const { hideTaskbarIcon, autoHideTaskbarIcon } = plugin.settings;
+    if (hideTaskbarIcon && autoHideTaskbarIcon) showTaskbarIcons();
     getWindows().forEach((win) => {
       if (maximizedWindows.has(win)) {
         win.maximize();
@@ -88,6 +99,7 @@ const vaultWindows = new Set(),
       win.isFocused() && win.blur(),
       plugin.settings.runInBackground ? win.hide() : win.minimize(),
     ]);
+    updateTaskbarIcons();
   },
   toggleWindows = (checkForFocus = true) => {
     const openWindows = getWindows().some((win) => {
@@ -97,35 +109,122 @@ const vaultWindows = new Set(),
     else showWindows();
   };
 
-const onWindowClose = (event) => event.preventDefault(),
+// PR #64: clicking an <a> without target=_blank reloads the page and
+// fires beforeunload, which would wrongly hide the window to the tray
+let isLinkNavigation = false;
+
+const onWindowClose = (event) => {
+    // PR #68: allow window to close during app quit (e.g. system shutdown)
+    // to prevent blocking macOS shutdown process
+    if (!isQuitting) event.preventDefault();
+  },
   onWindowUnload = (event) => {
+    // PR #68: allow window to close during app quit
+    if (isQuitting) return;
+    // PR #64: skip hide if the beforeunload was caused by link navigation
+    if (isLinkNavigation) {
+      isLinkNavigation = false;
+      return;
+    }
     log(LOG_WINDOW_CLOSE);
     getCurrentWindow().hide();
+    // PR #76: keep dock/taskbar state in sync after hiding
+    updateTaskbarIcons();
     event.stopImmediatePropagation();
     // setting return value manually is more reliable than
     // via `return false` according to electron
     event.returnValue = false;
   },
+  onAnchorClick = (event) => {
+    const target = event.target.closest('a');
+    if (target && target.getAttribute('target') !== '_blank') {
+      isLinkNavigation = true;
+    }
+  },
   interceptWindowClose = () => {
     // intercept in renderer
+    // PR #64: track link clicks so beforeunload from navigation isn't mistaken for a close
+    document.addEventListener('click', onAnchorClick);
     window.addEventListener("beforeunload", onWindowUnload, true);
     // intercept in main: is asynchronously executed when registered
     // from renderer, so won't prevent close by itself, but counteracts
     // the 3-second delayed window force close in obsidian.asar/main.js
     getCurrentWindow().on("close", onWindowClose);
+    // PR #68: listen for app quit events to allow proper shutdown,
+    // especially important for macOS system shutdown
+    app.on("before-quit", () => {
+      log("preparing for app quit");
+      isQuitting = true;
+      allowWindowClose();
+    });
   },
   allowWindowClose = () => {
+    document.removeEventListener('click', onAnchorClick);
     getCurrentWindow().removeListener("close", onWindowClose);
     window.removeEventListener("beforeunload", onWindowUnload, true);
   };
 
+// app.dock.show() resolves asynchronously, and macos silently drops dock
+// transitions requested while a previous one is still settling (e.g. a
+// hide issued during an in-flight show, which happens on launch with
+// "hide on launch" and when rapidly toggling window focus): track the
+// latest desired state and apply transitions one at a time with a settle
+let desiredDockVisibility = null,
+  dockTransitionInFlight = false;
+const applyDockVisibility = async () => {
+    if (dockTransitionInFlight) return;
+    dockTransitionInFlight = true;
+    try {
+      let retries = 0;
+      while (desiredDockVisibility !== null) {
+        const visible = desiredDockVisibility;
+        desiredDockVisibility = null;
+        try {
+          if (visible) {
+            // guard against a show that never resolves jamming the queue
+            await Promise.race([
+              app.dock.show(),
+              new Promise((resolve) => setTimeout(resolve, 1000)),
+            ]);
+          } else app.dock.hide();
+          // macos needs ~1s to settle a dock transition, and both
+          // swallows transitions requested within that window and
+          // misreports isVisible() during it: wait it out, then
+          // verify the state stuck and retry if it was dropped
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          if (desiredDockVisibility === null) {
+            if (app.dock.isVisible() !== visible && retries < 3) {
+              retries++;
+              desiredDockVisibility = visible;
+            } else retries = 0;
+          } else retries = 0;
+        } catch {}
+      }
+    } finally {
+      dockTransitionInFlight = false;
+    }
+  },
+  setDockVisibility = (visible) => {
+    if (process.platform !== "darwin") return;
+    desiredDockVisibility = visible;
+    applyDockVisibility();
+  };
+
 const hideTaskbarIcons = () => {
     getWindows().forEach((win) => win.setSkipTaskbar(true));
-    if (process.platform === "darwin") app.dock.hide();
+    setDockVisibility(false);
   },
   showTaskbarIcons = () => {
     getWindows().forEach((win) => win.setSkipTaskbar(false));
-    if (process.platform === "darwin") app.dock.show();
+    setDockVisibility(true);
+  },
+  windowsVisible = () =>
+    getWindows().some((win) => !win.isDestroyed() && win.isVisible()),
+  updateTaskbarIcons = () => {
+    if (!plugin.settings.hideTaskbarIcon) return;
+    if (plugin.settings.autoHideTaskbarIcon && windowsVisible()) {
+      showTaskbarIcons();
+    } else hideTaskbarIcons();
   },
   setLaunchOnStartup = () => {
     const { launchOnStartup, runInBackground, hideOnLaunch } = plugin.settings;
@@ -182,7 +281,15 @@ const addQuickNote = () => {
     return str.replace(/{{vault}}/g, plugin.app.vault.getName());
   },
   destroyTray = () => {
-    tray?.destroy();
+    // #35: on plugin reload the module re-evaluates and `tray` resets to
+    // undefined, so the orphaned native Tray lingers in the tray area.
+    // globalThis survives module re-evaluation, letting us destroy the
+    // previously-created icon before creating a new one.
+    const existing = globalThis[TRAY_GLOBAL_KEY];
+    if (existing) {
+      try { existing.destroy(); } catch {}
+      globalThis[TRAY_GLOBAL_KEY] = undefined;
+    }
     tray = undefined;
   },
   createTrayIcon = () => {
@@ -216,6 +323,8 @@ const addQuickNote = () => {
         { label: ACTION_CLOSE, click: closeVault },
       ]);
     tray = new Tray(obsidianIcon);
+    // #35: stash on globalThis so a later plugin reload can still destroy it
+    globalThis[TRAY_GLOBAL_KEY] = tray;
     tray.setContextMenu(contextMenu);
     tray.setToolTip(replaceVaultName(plugin.settings.trayIconTooltip));
     tray.on("click", () => {
@@ -244,6 +353,18 @@ const registerHotkeys = () => {
     try {
       globalShortcut.unregister(plugin.settings.toggleWindowFocusHotkey);
       globalShortcut.unregister(plugin.settings.quickNoteHotkey);
+    } catch {}
+  };
+
+// PR #61: URI handler for toggling windows — the only way to get a global
+// shortcut on Linux Wayland DEs without x11 legacy shortcut support.
+// Bind via: xdg-open obsidian://tray/toggleWindows
+const registerURIHandlers = (obsidian) => {
+    log(LOG_REGISTER_HANDLER);
+    try {
+      obsidian.registerObsidianProtocolHandler("tray/toggleWindows", () => {
+        toggleWindows();
+      });
     } catch {}
   };
 
@@ -283,15 +404,26 @@ const OPTIONS = [
   {
     key: "hideTaskbarIcon",
     desc: `
-      Hides the window's icon from from the dock/taskbar. Enabling the tray icon first
+      Hides the window's icon from the dock/taskbar. Enabling the tray icon first
       is recommended if using this option. This may not work on Linux-based OSes.
     `,
     type: "toggle",
     default: false,
     onChange() {
-      if (plugin.settings.hideTaskbarIcon) hideTaskbarIcons();
+      if (plugin.settings.hideTaskbarIcon) updateTaskbarIcons();
       else showTaskbarIcons();
     },
+  },
+  {
+    key: "autoHideTaskbarIcon",
+    desc: `
+      Only hide the dock/taskbar icon while all vault windows are hidden —
+      the icon reappears whenever a window is shown. Has no effect unless
+      "Hide taskbar icon" is enabled.
+    `,
+    type: "toggle",
+    default: false,
+    onChange: () => updateTaskbarIcons(),
   },
   {
     key: "createTrayIcon",
@@ -453,10 +585,25 @@ class TrayPlugin extends obsidian.Plugin {
     plugin = this;
     createTrayIcon();
     registerHotkeys();
+    registerURIHandlers(this);
     setLaunchOnStartup();
     observeWindows();
     if (settings.runInBackground) interceptWindowClose();
-    if (settings.hideTaskbarIcon) hideTaskbarIcons();
+    updateTaskbarIcons();
+    if (process.platform === "darwin") {
+      // window visibility can change without this plugin's involvement
+      // (uri activation, macos restoring the dock icon itself, another
+      // vault's cleanup) and no reliable renderer-side event exists for
+      // those: reconcile actual dock state against the expected state
+      this.registerInterval(
+        window.setInterval(() => {
+          if (!this.settings.hideTaskbarIcon) return;
+          if (dockTransitionInFlight || desiredDockVisibility !== null) return;
+          const target = this.settings.autoHideTaskbarIcon && windowsVisible();
+          if (app.dock.isVisible() !== target) setDockVisibility(target);
+        }, 2000)
+      );
+    }
     if (settings.hideOnLaunch) {
       this.registerEvent(this.app.workspace.onLayoutReady(hideWindows));
     }
